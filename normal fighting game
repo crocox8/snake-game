@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Mini 2D Fighter — Chrome Safe (Physics + Blood + Vector Female + Sword)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root { color-scheme: dark; }
+    html,body { height:100%; }
+    body { margin:0; background:#0e0e0f; color:#eaeaea; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif; }
+    #ui { display:flex; gap:16px; align-items:center; padding:10px 14px; background:#121214; position:sticky; top:0; }
+    #game { display:block; margin:0 auto; background:linear-gradient(#16181b, #0f1113); border:1px solid #222; box-shadow:0 0 24px rgba(0,0,0,.6) inset; }
+    .tag { padding:4px 8px; background:#1b1e22; border-radius:6px; }
+    .btn { background:#2a2f35; color:#eaeaea; border:none; padding:6px 10px; border-radius:6px; cursor:pointer; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div class="tag">Round: <span id="round">1</span>/3</div>
+    <div class="tag">P1 Wins: <span id="p1w">0</span></div>
+    <div class="tag">CPU Wins: <span id="p2w">0</span></div>
+    <div class="tag">Controls: A/D/W/S J/K/L, R + Gamepad</div>
+    <button id="restart" class="btn">Restart</button>
+  </div>
+  <canvas id="game" width="900" height="420"></canvas>
+
+  <script>
+  (() => {
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d', { alpha: true, desynchronized: false });
+    const W = canvas.width, H = canvas.height;
+    const floorY = H - 60;
+
+    // Chrome-safe image smoothing defaults
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+
+    // Robust feature checks
+    const hasRoundRect = typeof ctx.roundRect === 'function';
+    const hasEllipse = typeof ctx.ellipse === 'function';
+    const hasArcTo = typeof ctx.arcTo === 'function';
+
+    // Safe rounded-rect path (polyfill)
+    function roundedRectPath(rx, ry, rw, rh, r) {
+      const w = Math.abs(rw), h = Math.abs(rh);
+      const signX = Math.sign(rw) || 1, signY = Math.sign(rh) || 1;
+      const x0 = rx, y0 = ry, x1 = rx + rw, y1 = ry + rh;
+      const rad = Math.max(0, Math.min(r, w / 2, h / 2));
+      ctx.moveTo(x0 + signX * rad, y0);
+      if (hasArcTo) {
+        ctx.lineTo(x1 - signX * rad, y0);
+        ctx.arcTo(x1, y0, x1, y0 + signY * rad, rad);
+        ctx.lineTo(x1, y1 - signY * rad);
+        ctx.arcTo(x1, y1, x1 - signX * rad, y1, rad);
+        ctx.lineTo(x0 + signX * rad, y1);
+        ctx.arcTo(x0, y1, x0, y1 - signY * rad, rad);
+        ctx.lineTo(x0, y0 + signY * rad);
+        ctx.arcTo(x0, y0, x0 + signX * rad, y0, rad);
+      } else {
+        // Fallback: simple rect with tiny corner approximations
+        ctx.lineTo(x1, y0);
+        ctx.lineTo(x1, y1);
+        ctx.lineTo(x0, y1);
+        ctx.lineTo(x0, y0);
+      }
+      ctx.closePath();
+    }
+
+    // Helper: safe ellipse fallback
+    function safeEllipse(cx, cy, rx, ry, rot) {
+      if (hasEllipse) {
+        ctx.ellipse(cx, cy, rx, ry, rot || 0, 0, Math.PI * 2);
+      } else {
+        // Approximate ellipse by scaling a circle
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(rot || 0);
+        ctx.scale(rx, ry);
+        ctx.arc(0, 0, 1, 0, Math.PI * 2);
+        ctx.restore();
+      }
+    }
+
+    // Optional sprites are disabled by default (kept for future use)
+    const useSpriteSkin = false;
+
+    // Timing
+    let last = 0;
+    let timeMs = 0;
+
+    // Screen shake
+    let shakeT = 0, shakeMag = 0;
+
+    // Input (keyboard)
+    const keys = new Set();
+    const just = new Set();
+    addEventListener('keydown', (e) => { if (!keys.has(e.key)) just.add(e.key); keys.add(e.key); });
+    addEventListener('keyup', (e) => keys.delete(e.key));
+    document.getElementById('restart').onclick = () => hardReset();
+
+    // Input (gamepad) — safe usage; Chrome supports navigator.getGamepads
+    let gpPrev = null;
+    function pollGamepad() {
+      const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+      const gp = pads && pads[0];
+      const out = {
+        left:false,right:false,up:false,down:false,
+        block:false,light:false,heavy:false,restart:false,
+        just:{up:false, light:false, heavy:false, block:false, restart:false, left:false, right:false}
+      };
+      if (!gp) { gpPrev = null; return out; }
+      const axX = gp.axes && gp.axes.length ? gp.axes[0] : 0;
+      out.left = gp.buttons[14]?.pressed || axX < -0.35;
+      out.right = gp.buttons[15]?.pressed || axX > 0.35;
+      out.up = gp.buttons[0]?.pressed || false;      // A
+      out.light = gp.buttons[2]?.pressed || false;   // X
+      out.heavy = gp.buttons[3]?.pressed || false;   // Y
+      out.block = gp.buttons[5]?.pressed || false;   // RB
+      out.restart = gp.buttons[9]?.pressed || false; // Start
+      if (gpPrev) {
+        const j = (idx) => gp.buttons[idx]?.pressed && !gpPrev.buttons[idx]?.pressed;
+        out.just.up = j(0); out.just.light = j(2); out.just.heavy = j(3); out.just.block = j(5); out.just.restart = j(9);
+        const prevLeft = gpPrev.axes[0] < -0.35 || gpPrev.buttons[14]?.pressed;
+        const prevRight = gpPrev.axes[0] > 0.35 || gpPrev.buttons[15]?.pressed;
+        out.just.left = out.left && !prevLeft;
+        out.just.right = out.right && !prevRight;
+      }
+      gpPrev = { buttons: gp.buttons.map(b => ({ pressed: b.pressed })), axes: gp.axes.slice() };
+      return out;
+    }
+
+    // Helpers
+    const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+    const overlap = (a,b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+
+    // Physics and feel
+    const G = 2200, MOVE = 420, JUMP = 780, FRICTION = 1400;
+    const ACCEL_GROUND = 2600, ACCEL_AIR = 1400, MAX_SPEED = MOVE;
+    const COYOTE_MS = 140, JUMP_BUFFER_MS = 160, ATTACK_BUFFER_MS = 160;
+    const HITSTOP_L = 60, HITSTOP_H = 90;
+
+    // Attacks (extended range to account for sword)
+    const ATTACKS = {
+      L: { startup: 90, active: 120, recovery: 160, dmg: 6, kb: 320, chip: 2, range: 70, height: 40 },
+      H: { startup: 220, active: 180, recovery: 260, dmg: 12, kb: 520, chip: 3, range: 90, height: 50 },
+    };
+
+    // Blood FX
+    const blood = [], stains = [];
+    function spawnBlood(defender, spec, blocked) {
+      const count = blocked ? 6 : (spec === ATTACKS.H ? 24 : 14);
+      const baseDir = defender.face * -1;
+      const sx = defender.x + (defender.w/2) + baseDir * 14;
+      const sy = defender.y - defender.h + 32;
+      for (let i=0;i<count;i++){
+        const ang = (Math.random()*0.6 - 0.3) + (baseDir>0 ? 0 : Math.PI);
+        const speed = (spec === ATTACKS.H ? 520 : 360) * (0.5 + Math.random()*0.8);
+        blood.push({ x:sx, y:sy, vx: Math.cos(ang)*speed, vy: Math.sin(ang)*speed - 120, r: 2 + Math.random()*2, life: 500 + Math.random()*400, alpha: 0.9 });
+      }
+    }
+    function updateBlood(dt) {
+      for (let i=blood.length-1;i>=0;i--){
+        const p = blood[i];
+        p.vy += G * dt * 1.1; p.vx *= (1 - 0.04*dt);
+        p.x += p.vx*dt; p.y += p.vy*dt;
+        p.life -= dt*1000; p.alpha = Math.max(0, p.life/600);
+        if (p.y >= floorY - 1) { stains.push({ x: p.x + (Math.random()*3-1.5), y: floorY - 1, r: p.r * (1.2 + Math.random()*0.8), alpha: 0.55 + Math.random()*0.2, t: 0 }); blood.splice(i,1); continue; }
+        if (p.life <= 0) blood.splice(i,1);
+      }
+      for (let i=stains.length-1;i>=0;i--){ const s = stains[i]; s.t += dt*1000; s.alpha *= (1 - 0.0008*s.t*dt); if (s.alpha < 0.03) stains.splice(i,1); }
+    }
+    function drawBlood() {
+      // stains
+      for (const s of stains){
+        ctx.save();
+        ctx.globalAlpha = clamp(s.alpha, 0, 1);
+        const grad = ctx.createRadialGradient(s.x, s.y, 1, s.x, s.y, s.r*2.2);
+        grad.addColorStop(0, '#5e0b0b'); grad.addColorStop(1, 'rgba(94,11,11,0)');
+        ctx.fillStyle = grad;
+        ctx.beginPath(); ctx.arc(s.x, s.y, s.r*2.2, 0, Math.PI*2); ctx.fill();
+        ctx.restore();
+      }
+      // active droplets
+      ctx.save();
+      ctx.fillStyle = '#8b0000';
+      for (const p of blood){
+        ctx.globalAlpha = clamp(p.alpha, 0, 1);
+        ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI*2); ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    // Fighter factory
+    function makeFighter(x, color) {
+      return {
+        x, y: floorY, vx: 0, vy: 0, ax: 0,
+        w: 44, h: 80, face: 1,
+        grounded: true, wasGrounded: true,
+        state: 'idle', stateT: 0,
+        hp: 100, wins: 0,
+        atk: null, canAct: true,
+        tint: 0, sparkT: 0, alpha: 1, deadT: 0, color,
+        coyote: 0, jbuf: 0, abuf: null, hitstunFor: 220,
+        bJ: { x:0, y:0, vx:0, vy:0 } // jiggle state
+      };
+    }
+    const P1 = makeFighter(W*0.25, '#4fc3f7');
+    const CPU = makeFighter(W*0.75, '#ef9a9a');
+
+    // Match state
+    let round = 1, freezeT = 0, running = true;
+
+    function hardReset() {
+      round = 1; P1.wins = 0; CPU.wins = 0;
+      document.getElementById('p1w').textContent = P1.wins;
+      document.getElementById('p2w').textContent = CPU.wins;
+      resetRound();
+    }
+    function resetRound() {
+      for (const p of [P1, CPU]) {
+        p.x = (p === P1) ? W*0.25 : W*0.75;
+        p.y = floorY; p.vx = 0; p.vy = 0; p.ax = 0;
+        p.face = (p === P1) ? 1 : -1;
+        p.grounded = true; p.wasGrounded = true; p.state = 'idle'; p.stateT = 0;
+        p.hp = 100; p.atk = null; p.canAct = true;
+        p.tint = 0; p.sparkT = 0; p.alpha = 1; p.deadT = 0;
+        p.coyote = 0; p.jbuf = 0; p.abuf = null; p.hitstunFor = 220;
+        p.bJ = { x:0, y:0, vx:0, vy:0 };
+      }
+      document.getElementById('round').textContent = round;
+      freezeT = 700; running = true;
+      ai.nextAt = timeMs + 200; ai.blockUntil = 0;
+      blood.length = 0; stains.length = 0;
+      shakeT = 0; shakeMag = 0;
+    }
+    function faceEachOther() { P1.face = (CPU.x >= P1.x) ? 1 : -1; CPU.face = (P1.x >= CPU.x) ? 1 : -1; }
+
+    function startAttack(p, type) {
+      if (!p.canAct || p.state==='hitstun' || p.state==='dead') return;
+      if (p.state==='attackL' || p.state==='attackH') return;
+      p.state = (type==='L') ? 'attackL' : 'attackH';
+      p.stateT = 0; p.atk = { type, t: 0, hitLanded: false }; p.canAct = false;
+    }
+    function startBlock(p) { if (!p.canAct || !p.grounded || p.state==='dead') return; p.state='block'; p.stateT=0; }
+    function endBlock(p) { if (p.state==='block') { p.state='idle'; p.stateT=0; } }
+
+    function activeHitbox(p, spec) {
+      const fh = spec.height, fw = spec.range;
+      const x = p.face === 1 ? p.x + p.w : p.x - fw;
+      const y = p.y - fh - 14;
+      return { x, y, w: fw, h: fh };
+    }
+    function isAttackActive(p) { if (!p.atk) return false; const s = ATTACKS[p.atk.type]; return p.atk.t >= s.startup && p.atk.t < s.startup + s.active; }
+    function isAttackStartup(p) { if (!p.atk) return false; const s = ATTACKS[p.atk.type]; return p.atk.t < s.startup; }
+
+    function applyHit(attacker, defender, spec) {
+      if (defender.state==='dead') return;
+      const blocking = (defender.state==='block' && defender.grounded);
+      const dmg = blocking ? spec.chip : spec.dmg;
+      const kb = blocking ? spec.kb * 0.35 : spec.kb;
+
+      defender.hp = clamp(defender.hp - dmg, 0, 100);
+      defender.vx = attacker.face * (kb * 0.7);
+      defender.vy = defender.grounded ? -kb*0.25 : defender.vy - kb*0.18;
+      defender.grounded = false;
+      defender.state = defender.hp <= 0 ? 'dead' : 'hitstun';
+      defender.stateT = 0;
+      defender.tint = 200; defender.sparkT = 100;
+      defender.hitstunFor = (blocking ? 120 : 160) + kb * (blocking ? 0.2 : 0.35);
+
+      if (defender.hp <= 0) { defender.vx *= 0.6; defender.vy = Math.min(defender.vy, -220); }
+
+      const stop = (spec === ATTACKS.H) ? HITSTOP_H : HITSTOP_L;
+      freezeT = Math.max(freezeT, stop);
+      shakeT = 120; shakeMag = Math.min(12, 4 + kb / 120);
+
+      defender.bJ.vy += (spec.kb * 0.02); // jiggle impulse
+      spawnBlood(defender, spec, blocking);
+    }
+
+    // Player input
+    function handleP1Input(p, dt, justKeys, gp) {
+      if (p.state==='dead') return;
+      const left = keys.has('a') || keys.has('A') || gp.left;
+      const right = keys.has('d') || keys.has('D') || gp.right;
+      const down = keys.has('s') || keys.has('S') || gp.down;
+      const blockHeld = keys.has('l') || keys.has('L') || gp.block;
+      const lightHeld = keys.has('j') || keys.has('J') || gp.light;
+      const heavyHeld = keys.has('k') || keys.has('K') || gp.heavy;
+      const jumpJust = justKeys.has('w') || justKeys.has('W') || gp.just.up;
+      const lightJust = justKeys.has('j') || justKeys.has('J') || gp.just.light;
+      const heavyJust = justKeys.has('k') || justKeys.has('K') || gp.just.heavy;
+
+      if (justKeys.has('r') || justKeys.has('R') || gp.just.restart) hardReset();
+
+      p.ax = 0; if (left && !right) p.ax = -1; else if (right && !left) p.ax = 1;
+
+      if (jumpJust) p.jbuf = JUMP_BUFFER_MS;
+      if (p.jbuf > 0) p.jbuf -= dt*1000;
+      if (p.coyote > 0) p.coyote -= dt*1000;
+
+      if (p.canAct && (p.grounded || p.coyote > 0) && p.jbuf > 0) { p.vy = -JUMP; p.grounded = false; p.state='jump'; p.stateT=0; p.jbuf = 0; p.coyote = 0; }
+
+      if (down && p.grounded && p.canAct && p.state!=='block') p.state='crouch'; else if (p.state === 'crouch') p.state='idle';
+
+      if (blockHeld) startBlock(p); else endBlock(p);
+
+      if (lightJust) p.abuf = { type: 'L', t: ATTACK_BUFFER_MS };
+      if (heavyJust) p.abuf = { type: 'H', t: ATTACK_BUFFER_MS };
+      if (p.abuf) p.abuf.t -= dt*1000;
+      if (p.canAct && p.abuf && p.abuf.t > 0) { startAttack(p, p.abuf.type); p.abuf = null; }
+
+      if (lightHeld && p.canAct && !p.atk) startAttack(p, 'L');
+      if (heavyHeld && p.canAct && !p.atk) startAttack(p, 'H');
+    }
+
+    // Damped jiggle update
+    function updateJiggle(p, dt) {
+      const speedFactor = clamp(Math.abs(p.vx)/MAX_SPEED, 0, 1);
+      const targetY = clamp(2 + speedFactor*5 + (p.grounded ? 0 : clamp(-p.vy*0.01, -6, 6)), -8, 12);
+      const targetX = clamp((p.vx>=0?1:-1) * speedFactor*2, -3.5, 3.5);
+      const kY = 90, dY = 14; const kX = 60, dX = 10;
+      const ay = -kY*(p.bJ.y - targetY) - dY*p.bJ.vy; p.bJ.vy += ay*dt; p.bJ.y += p.bJ.vy*dt;
+      const ax = -kX*(p.bJ.x - targetX) - dX*p.bJ.vx; p.bJ.vx += ax*dt; p.bJ.x += p.bJ.vx*dt;
+      if (!p.wasGrounded && p.grounded) p.bJ.vy += 90;
+    }
+
+    function updateFighter(p, dt) {
+      p.stateT += dt*1000; p.tint = Math.max(0, p.tint - dt*600); p.sparkT = Math.max(0, p.sparkT - dt*1000);
+      p.wasGrounded = p.grounded;
+      if (!p.grounded) p.vy += G*dt;
+      if (p === P1) {
+        const accel = p.grounded ? ACCEL_GROUND : ACCEL_AIR;
+        p.vx += p.ax * accel * dt;
+        if (p.ax === 0) { if (p.vx > 0) p.vx = Math.max(0, p.vx - FRICTION*dt); if (p.vx < 0) p.vx = Math.min(0, p.vx + FRICTION*dt); }
+        p.vx = clamp(p.vx, -MOVE*1.2, MOVE*1.2);
+      }
+      p.x += p.vx*dt; p.y += p.vy*dt;
+      if (p.y >= floorY) { if (!p.grounded) { p.grounded = true; p.vy = 0; if (p.state==='jump') p.state='idle'; } p.y = floorY; }
+      else { if (p.wasGrounded && !p.grounded && p.state!=='jump') p.coyote = COYOTE_MS; }
+      p.x = clamp(p.x, 20, W-20 - p.w);
+
+      if (p.state==='dead') { p.deadT += dt*1000; p.alpha = Math.max(0.15, 1 - p.deadT/1200); p.vx *= 0.98; return; }
+
+      if (p.state!=='block' && p.state!=='crouch' && !String(p.state).startsWith('attack') && p.state!=='hitstun')
+        p.state = Math.abs(p.vx) > 40 ? 'run' : 'idle';
+
+      if (p.atk) {
+        const spec = ATTACKS[p.atk.type]; p.atk.t += dt*1000;
+        if (p.atk.t >= spec.startup + spec.active + spec.recovery) { p.atk = null; p.canAct = true; if (p.state.startsWith('attack')) p.state='idle'; }
+        else if (p.atk.t >= spec.startup) { p.canAct = false; }
+        if (p.state.startsWith('attack')) p.vx *= 0.85;
+      }
+
+      if (p.state==='hitstun') { if (p.stateT >= p.hitstunFor) { p.state = p.grounded ? 'idle' : 'jump'; p.stateT = 0; } }
+
+      updateJiggle(p, dt);
+    }
+
+    function resolveHits() {
+      function activeFor(p) {
+        if (!p.atk) return null; const spec = ATTACKS[p.atk.type];
+        const t = p.atk.t; const active = (t >= spec.startup && t < spec.startup + spec.active);
+        return active ? {spec, hb: activeHitbox(p, spec)} : null;
+      }
+      const a1 = activeFor(P1), a2 = activeFor(CPU);
+      const p1Hurt = { x:P1.x, y:P1.y - P1.h, w:P1.w, h:P1.h };
+      const p2Hurt = { x:CPU.x, y:CPU.y - CPU.h, w:CPU.w, h:CPU.h };
+      const p1Hits = a1 && overlap(a1.hb, p2Hurt);
+      const p2Hits = a2 && overlap(a2.hb, p1Hurt);
+      if (p1Hits && p2Hits) {
+        if (!P1.atk.hitLanded) { applyHit(P1, CPU, a1.spec); P1.atk.hitLanded = true; }
+        if (!CPU.atk.hitLanded) { applyHit(CPU, P1, a2.spec); CPU.atk.hitLanded = true; }
+        return;
+      }
+      if (p1Hits && P1.atk && !P1.atk.hitLanded) { applyHit(P1, CPU, a1.spec); P1.atk.hitLanded = true; }
+      if (p2Hits && CPU.atk && !CPU.atk.hitLanded) { applyHit(CPU, P1, a2.spec); CPU.atk.hitLanded = true; }
+    }
+
+    // Simple Utility AI (unchanged)
+    const ai = { nextAt: 0, blockUntil: 0, action: 'idle' };
+    function cpuUtilityDecide() {
+      if (CPU.state==='dead') return 'idle';
+      const dist = Math.abs(P1.x - CPU.x);
+      const near = dist < 80, mid = dist < 140, far = dist >= 140;
+      const oppAttacking = !!P1.atk;
+      const oppActive = isAttackActive(P1);
+      const oppStartup = isAttackStartup(P1);
+      const canKillWithH = P1.hp <= ATTACKS.H.dmg, canKillWithL = P1.hp <= ATTACKS.L.dmg;
+      const U = { approach:0, retreat:0, block:0, jump:0, light:0, heavy:0, whiffPunish:0 };
+      U.approach = far ? 0.9 : mid ? 0.5 : 0.1;
+      U.retreat = (near && oppAttacking) ? 0.7 : 0.15;
+      if (oppActive && near && CPU.grounded) U.block = 0.95;
+      else if (oppStartup && mid && CPU.grounded) U.block = 0.5;
+      U.jump = (!CPU.grounded ? 0.1 : (oppActive && near ? 0.2 : (mid && Math.random()<0.1 ? 0.2 : 0.05)));
+      const oppRecovering = oppAttacking && !oppActive && !oppStartup;
+      if (oppRecovering && mid) U.whiffPunish = 0.9;
+      U.light = near ? 0.8 : mid ? 0.55 : 0.1;
+      U.heavy = (mid ? 0.7 : near ? 0.45 : 0.15) + (canKillWithH ? 0.25 : 0);
+      if (U.block > 0.8 && far) { U.light *= 0.6; U.heavy *= 0.6; }
+      for (const k in U) U[k] = Math.min(1, Math.max(0, U[k] + (Math.random()*0.08 - 0.04)));
+      let best = 'idle', bestV = -1; for (const [k,v] of Object.entries(U)) { if (v > bestV) { bestV = v; best = k; } }
+      return best;
+    }
+    function cpuAct(decision, dt) {
+      if (timeMs < ai.blockUntil) startBlock(CPU); else if (CPU.state==='block') endBlock(CPU);
+      switch (decision) {
+        case 'approach': CPU.vx = (P1.x < CPU.x) ? -MOVE : MOVE; break;
+        case 'retreat':  CPU.vx = (P1.x < CPU.x) ? MOVE : -MOVE; break;
+        case 'block':    startBlock(CPU); ai.blockUntil = timeMs + 220 + Math.random()*120; break;
+        case 'jump':     if (CPU.grounded && CPU.canAct) { CPU.vy = -JUMP; CPU.grounded=false; CPU.state='jump'; CPU.stateT=0; } break;
+        case 'whiffPunish': if (CPU.canAct) startAttack(CPU, Math.random() < 0.5 ? 'H' : 'L'); break;
+        case 'heavy':    if (CPU.canAct) startAttack(CPU, 'H'); break;
+        case 'light':    if (CPU.canAct) startAttack(CPU, 'L'); break;
+        default:
+          if (CPU.vx > 0) CPU.vx = Math.max(0, CPU.vx - FRICTION*dt);
+          if (CPU.vx < 0) CPU.vx = Math.min(0, CPU.vx + FRICTION*dt);
+      }
+    }
+    function cpuUpdate(dt) { if (timeMs >= ai.nextAt) { ai.action = cpuUtilityDecide(); ai.nextAt = timeMs + 90 + Math.random()*70; } cpuAct(ai.action, dt); }
+
+    // Sword draw (Chrome-safe rounded rects)
+    function drawSword(handX, handY, dir, state) {
+      ctx.save();
+      ctx.translate(handX, handY);
+      const ang = 0.10 + (state.startsWith('attack') ? (state==='attackH' ? 0.55 : 0.35) : 0);
+      ctx.rotate((dir===1 ? ang : -ang));
+
+      // Hilt
+      ctx.fillStyle = '#6d4c41'; ctx.strokeStyle = '#3e2723'; ctx.lineWidth = 2;
+      ctx.beginPath();
+      if (hasRoundRect) ctx.roundRect(-6, -4, 12, 22, 4); else roundedRectPath(-6, -4, 12, 22, 4);
+      ctx.fill(); ctx.stroke();
+
+      // Guard
+      ctx.fillStyle = '#b0bec5'; ctx.strokeStyle = '#78909c';
+      ctx.beginPath();
+      if (hasRoundRect) ctx.roundRect(-20, 14, 40, 6, 3); else roundedRectPath(-20, 14, 40, 6, 3);
+      ctx.fill(); ctx.stroke();
+
+      // Blade
+      const bladeGrad = ctx.createLinearGradient(0, 20, 0, 160);
+      bladeGrad.addColorStop(0, '#e0f7fa'); bladeGrad.addColorStop(1, '#90a4ae');
+      ctx.fillStyle = bladeGrad; ctx.strokeStyle = '#546e7a';
+      ctx.beginPath(); ctx.moveTo(-4, 20); ctx.lineTo(4, 20); ctx.lineTo(8, 170); ctx.lineTo(-8, 170); ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(-8, 170); ctx.lineTo(0, 184); ctx.lineTo(8, 170); ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.restore();
+    }
+
+    // Female vector body, bikini, sword
+    function drawFemaleBody(p) {
+      const x = p.x|0, y = p.y|0, w = p.w, h = p.h, face = p.face;
+      const cx = x + w/2; const top = y - h;
+      const skinBase = '#f2d3c2', skinShadow = '#e1b8a3';
+      const bikiniTop = '#e91e63', bikiniTopHi = '#ff6f9e', bikiniBot = '#c2185b';
+      const line = '#121212';
+      const bX = p.bJ.x || 0, bY = p.bJ.y || 0;
+
+      ctx.save();
+      if (p.tint > 0) ctx.filter = 'brightness(1.08) saturate(1.1)';
+
+      // Torso
+      ctx.save();
+      const torsoGrad = ctx.createLinearGradient(cx, top + h*0.18, cx, top + h*0.68);
+      torsoGrad.addColorStop(0, skinBase); torsoGrad.addColorStop(1, skinShadow);
+      ctx.fillStyle = torsoGrad; ctx.strokeStyle = line; ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cx - w*0.30, top + h*0.20);
+      ctx.bezierCurveTo(cx - w*0.34, top + h*0.32, cx - w*0.20, top + h*0.44, cx - w*0.16, top + h*0.58);
+      ctx.bezierCurveTo(cx - w*0.09, top + h*0.74, cx - w*0.12, top + h*0.82, cx,            top + h*0.86);
+      ctx.bezierCurveTo(cx + w*0.12, top + h*0.82, cx + w*0.09, top + h*0.74, cx + w*0.16, top + h*0.58);
+      ctx.bezierCurveTo(cx + w*0.20, top + h*0.44, cx + w*0.34, top + h*0.32, cx + w*0.30, top + h*0.20);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.restore();
+
+      // Arms and sword
+      ctx.save(); ctx.fillStyle = skinBase; ctx.strokeStyle = line; ctx.lineWidth = 2;
+      const armY = top + h*0.30, armLen = w*0.46, armW = w*0.11, dir = face;
+
+      // Lead arm (front)
+      const leadX = cx + dir*w*0.22, leadY = armY;
+      ctx.beginPath();
+      if (hasRoundRect) ctx.roundRect(leadX, leadY, dir*armLen, armW, armW*0.3); else roundedRectPath(leadX, leadY, dir*armLen, armW, armW*0.3);
+      ctx.fill(); ctx.stroke();
+
+      // Sword at lead hand
+      const handX = leadX + dir*armLen, handY = leadY + armW*0.5;
+      drawSword(handX, handY, dir, p.state);
+
+      // Rear arm behind torso
+      ctx.globalCompositeOperation = 'destination-over';
+      const rearX = cx - dir*w*0.22 - dir*armLen, rearY = armY + armW*0.1;
+      ctx.beginPath();
+      if (hasRoundRect) ctx.roundRect(rearX, rearY, dir*armLen, armW, armW*0.3); else roundedRectPath(rearX, rearY, dir*armLen, armW, armW*0.3);
+      ctx.fill(); ctx.stroke();
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.restore();
+
+      // Legs
+      ctx.save(); ctx.fillStyle = skinBase; ctx.strokeStyle = line; ctx.lineWidth = 2;
+      const thighY = top + h*0.84, legW = w*0.16, legH = h*0.22;
+      ctx.beginPath();
+      if (hasRoundRect) ctx.roundRect(cx - w*0.12 - legW/2, thighY, legW, legH, legW*0.3); else roundedRectPath(cx - w*0.12 - legW/2, thighY, legW, legH, legW*0.3);
+      ctx.fill(); ctx.stroke();
+      ctx.beginPath();
+      if (hasRoundRect) ctx.roundRect(cx + w*0.12 - legW/2, thighY, legW, legH, legW*0.3); else roundedRectPath(cx + w*0.12 - legW/2, thighY, legW, legH, legW*0.3);
+      ctx.fill(); ctx.stroke();
+      ctx.restore();
+
+      // Bikini top (two cups with jiggle offset)
+      ctx.save(); ctx.strokeStyle = line; ctx.lineWidth = 2;
+      const chestY = top + h*0.38 + bY*0.6, cupR = w*0.13;
+      const leftCupX = cx - w*0.12 - bX*0.5, rightCupX = cx + w*0.12 + bX*0.5;
+      let cupGradL = ctx.createLinearGradient(leftCupX, chestY - cupR, leftCupX, chestY + cupR);
+      cupGradL.addColorStop(0, bikiniTopHi); cupGradL.addColorStop(1, bikiniTop);
+      ctx.fillStyle = cupGradL; ctx.beginPath(); safeEllipse(leftCupX, chestY, cupR*1.05, cupR*0.9, 0); ctx.fill(); ctx.stroke();
+      let cupGradR = ctx.createLinearGradient(rightCupX, chestY - cupR, rightCupX, chestY + cupR);
+      cupGradR.addColorStop(0, bikiniTopHi); cupGradR.addColorStop(1, bikiniTop);
+      ctx.fillStyle = cupGradR; ctx.beginPath(); safeEllipse(rightCupX, chestY, cupR*1.05, cupR*0.9, 0); ctx.fill(); ctx.stroke();
+      // Center band
+      ctx.fillStyle = bikiniTop; ctx.beginPath();
+      ctx.moveTo(leftCupX + cupR*0.6, chestY + cupR*0.2);
+      ctx.quadraticCurveTo(cx, chestY + cupR*0.5, rightCupX - cupR*0.6, chestY + cupR*0.2);
+      ctx.quadraticCurveTo(cx, chestY + cupR*0.05, leftCupX + cupR*0.6, chestY + cupR*0.2);
+      ctx.fill(); ctx.stroke();
+      // Straps
+      ctx.beginPath();
+      ctx.moveTo(leftCupX - cupR*0.8, chestY - cupR*0.2); ctx.lineTo(leftCupX - cupR*1.2, chestY - cupR*1.2);
+      ctx.moveTo(rightCupX + cupR*0.8, chestY - cupR*0.2); ctx.lineTo(rightCupX + cupR*1.2, chestY - cupR*1.2);
+      ctx.stroke(); ctx.restore();
+
+      // Bikini bottom
+      ctx.save();
+      const botGrad = ctx.createLinearGradient(cx, top + h*0.72, cx, top + h*0.88);
+      botGrad.addColorStop(0, bikiniBot); botGrad.addColorStop(1, bikiniTop);
+      ctx.fillStyle = botGrad; ctx.strokeStyle = line; ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cx - w*0.28, top + h*0.74);
+      ctx.quadraticCurveTo(cx,           top + h*0.92, cx + w*0.28, top + h*0.74);
+      ctx.quadraticCurveTo(cx + w*0.12,  top + h*0.70, cx,           top + h*0.70);
+      ctx.quadraticCurveTo(cx - w*0.12,  top + h*0.70, cx - w*0.28, top + h*0.74);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      // side ties
+      ctx.beginPath();
+      ctx.moveTo(cx - w*0.28, top + h*0.74); ctx.lineTo(cx - w*0.34, top + h*0.76);
+      ctx.moveTo(cx + w*0.28, top + h*0.74); ctx.lineTo(cx + w*0.34, top + h*0.76);
+      ctx.stroke(); ctx.restore();
+
+      ctx.restore();
+    }
+
+    function drawFace(p) {
+      const x = p.x|0, y = p.y|0, headX = x + p.w/2, headY = y - p.h + 22;
+      ctx.save(); ctx.globalAlpha *= p.alpha;
+      if (p.state === 'dead') {
+        ctx.strokeStyle = '#212121'; ctx.lineWidth = 2;
+        for (const dx of [-8, 8]) { ctx.beginPath(); ctx.moveTo(headX + dx - 4, headY - 4); ctx.lineTo(headX + dx + 4, headY + 4);
+          ctx.moveTo(headX + dx + 4, headY - 4); ctx.lineTo(headX + dx - 4, headY + 4); ctx.stroke(); }
+      } else {
+        ctx.fillStyle = '#fafafa'; ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5;
+        ctx.beginPath(); safeEllipse(headX - 8, headY, 4, 3, 0); ctx.fill(); ctx.stroke();
+        ctx.beginPath(); safeEllipse(headX + 8, headY, 4, 3, 0); ctx.fill(); ctx.stroke();
+        const px = (p.state.startsWith('attack')) ? (p.face===1? 1.5:-1.5) : 0;
+        ctx.fillStyle = '#000';
+        ctx.beginPath(); ctx.arc(headX - 8 + px, headY, 1.5, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(headX + 8 + px, headY, 1.5, 0, Math.PI*2); ctx.fill();
+      }
+      ctx.strokeStyle = '#1a1a1a'; ctx.lineWidth = 2; ctx.beginPath();
+      if (p.state==='hitstun') { ctx.moveTo(headX - 12, headY - 6); ctx.lineTo(headX - 4, headY - 8); ctx.moveTo(headX + 12, headY - 6); ctx.lineTo(headX + 4, headY - 8); ctx.stroke(); }
+      else if (p.state.startsWith('attack')) { ctx.moveTo(headX - 12, headY - 8); ctx.lineTo(headX - 4, headY - 5); ctx.moveTo(headX + 12, headY - 8); ctx.lineTo(headX + 4, headY - 5); ctx.stroke(); }
+      ctx.strokeStyle = '#111'; ctx.lineWidth = 2; ctx.beginPath();
+      if (p.state==='hitstun') ctx.arc(headX, headY + 8, 6, Math.PI*0.1, Math.PI*0.9);
+      else if (p.state.startsWith('attack')) ctx.arc(headX, headY + 7, 6, Math.PI*1.1, Math.PI*1.9);
+      else if (p.state==='dead') { ctx.moveTo(headX-6, headY+8); ctx.lineTo(headX+6, headY+8); }
+      else ctx.arc(headX, headY + 8, 5, Math.PI*0.1, Math.PI*0.9);
+      ctx.stroke(); ctx.restore();
+    }
+
+    function drawFighter(p) {
+      // shadow
+      ctx.save(); ctx.globalAlpha = p.alpha; ctx.fillStyle = 'rgba(0,0,0,.35)';
+      ctx.beginPath(); ctx.ellipse(p.x + p.w/2, floorY+2, p.w*0.45, 10, 0, 0, Math.PI*2); ctx.fill(); ctx.restore();
+
+      // body
+      ctx.save(); ctx.globalAlpha = p.alpha; drawFemaleBody(p);
+      // impact sparks
+      if (p.sparkT > 0) {
+        const x = p.x|0, y = p.y|0;
+        ctx.save(); ctx.globalAlpha = Math.min(p.alpha, p.sparkT/100); ctx.fillStyle = '#ffd54f';
+        const sx = p.face===1 ? x+p.w+8 : x-8; const sy = y - p.h + 30;
+        for (let i=0;i<6;i++){ ctx.beginPath(); ctx.arc(sx + Math.cos(i)*6, sy + Math.sin(i)*6, 2, 0, Math.PI*2); ctx.fill(); }
+        ctx.restore();
+      }
+      ctx.restore();
+
+      // face on top for readability
+      drawFace(p);
+    }
+
+    function drawHUD() {
+      ctx.strokeStyle = '#1f2328'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(0, floorY+0.5); ctx.lineTo(W, floorY+0.5); ctx.stroke();
+      function bar(x, y, w, h, hp, col) {
+        ctx.fillStyle = '#262b31'; ctx.fillRect(x, y, w, h);
+        ctx.fillStyle = col; ctx.fillRect(x, y, (hp/100)*w, h);
+        ctx.strokeStyle = '#0e1114'; ctx.strokeRect(x+0.5, y+0.5, w-1, h-1);
+      }
+      bar(30, 20, 340, 18, P1.hp, '#64ffda');
+      bar(W-30-340, 20, 340, 18, CPU.hp, '#ff9e9e');
+      ctx.fillStyle = '#cfd8dc'; ctx.font = '16px system-ui'; ctx.fillText(`R${round}`, W/2 - 10, 34);
+    }
+
+    function draw() {
+      ctx.fillStyle = '#0f1215'; ctx.fillRect(0,0,W,H);
+      ctx.save();
+      if (shakeT > 0) {
+        const t = Math.min(1, shakeT/120);
+        const mag = shakeMag * t;
+        ctx.translate((Math.random()*2-1)*mag, (Math.random()*2-1)*mag);
+      }
+      drawHUD(); drawBlood(); drawFighter(P1); drawFighter(CPU);
+      ctx.restore();
+      if (freezeT > 0) { ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillRect(0,0,W,H); }
+    }
+
+    function update(dt) {
+      if (!running) return;
+      const justKeys = new Set(just); just.clear();
+      const gp = pollGamepad();
+      if (freezeT > 0) { freezeT -= dt*1000; return; }
+
+      handleP1Input(P1, dt, justKeys, gp);
+      faceEachOther(); cpuUpdate(dt);
+      updateFighter(P1, dt); updateFighter(CPU, dt);
+      resolveHits(); updateBlood(dt);
+      if (shakeT > 0) shakeT -= dt*1000;
+
+      const p1Dead = P1.state==='dead' && P1.alpha <= 0.2;
+      const p2Dead = CPU.state==='dead' && CPU.alpha <= 0.2;
+      if (p1Dead || p2Dead) {
+        if (P1.deadT > 1200 || CPU.deadT > 1200) {
+          if (P1.hp <= 0 && CPU.hp > 0) { CPU.wins++; document.getElementById('p2w').textContent = CPU.wins; }
+          else if (CPU.hp <= 0 && P1.hp > 0) { P1.wins++; document.getElementById('p1w').textContent = P1.wins; }
+          if (P1.wins >= 2 || CPU.wins >= 2) { round = 1; P1.wins = 0; CPU.wins = 0; document.getElementById('p1w').textContent = P1.wins; document.getElementById('p2w').textContent = CPU.wins; }
+          else { round++; }
+          resetRound();
+        }
+      }
+    }
+
+    function loop(ts) {
+      const dt = Math.min(0.033, (ts - last) / 1000);
+      last = ts; timeMs += dt*1000;
+      update(dt); draw();
+      requestAnimationFrame(loop);
+    }
+
+    // Init
+    document.getElementById('p1w').textContent = P1.wins;
+    document.getElementById('p2w').textContent = CPU.wins;
+    document.getElementById('round').textContent = round;
+    resetRound();
+    requestAnimationFrame(loop);
+  })();
+  </script>
+</body>
+</html>
